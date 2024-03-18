@@ -26,8 +26,11 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+from torch.utils.tensorboard import SummaryWriter
 
 from model import GPTConfig, GPT
+
+writer = SummaryWriter()
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -72,6 +75,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
+dynamic_heads = False
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -154,6 +158,7 @@ if init_from == 'scratch':
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
+    gptconf.dynamic_heads = dynamic_heads
     model = GPT(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
@@ -218,12 +223,17 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        nlls = torch.zeros(eval_iters)
+        num_bytes = 0
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
+            nlls[k] = - torch.log2(torch.exp(torch.gather(logits, 2, Y.unsqueeze(-1))).squeeze() / torch.sum(torch.exp(logits), -1)).sum()
+            num_bytes += X.numel()
         out[split] = losses.mean()
+        out[f"{split}_perplexity"] = torch.exp(nlls.sum() / num_bytes)
     model.train()
     return out
 
@@ -262,7 +272,12 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {iter_num}: train loss {losses['train_perplexity']:.4f}, val loss {losses['val_perplexity']:.4f}")
+        writer.add_scalar("Loss/train_perplexity", losses['train_perplexity'], iter_num)
+        writer.add_scalar("Loss/val_perplexity", losses['val_perplexity'], iter_num)
+        writer.add_scalar("Loss/train", losses['train'], iter_num)
+        writer.add_scalar("Loss/val", losses['val'], iter_num)
+        writer.flush()
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -334,3 +349,5 @@ while True:
 
 if ddp:
     destroy_process_group()
+
+writer.close()

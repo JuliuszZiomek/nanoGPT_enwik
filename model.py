@@ -34,7 +34,15 @@ class CausalSelfAttention(nn.Module):
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        if not hasattr(config, "dynamic_heads"):
+            config.dynamic_heads = False
+
+        if config.dynamic_heads:
+            self.c_proj = nn.Identity()
+        else:
+            self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        
+        self.dynamic_heads = config.dynamic_heads
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -49,7 +57,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, head_allocation):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -69,11 +77,43 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
+        if self.dynamic_heads:
+            y = y * head_allocation.reshape(B, self.n_head, 1, 1).repeat(1, 1, T, C // self.n_head)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
+    
+class HeadController(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc    = nn.Linear(config.n_embd * config.block_size, 32, bias=config.bias)
+        self.gelu    = nn.GELU()
+        self.c_proj  = nn.Linear(32, 32, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+        self.c_out  = nn.Linear(32, config.n_head, bias=config.bias)
+        self.softmax = nn.functional.gumbel_softmax
+
+        self.n_head = config.n_head
+
+    def forward(self, x):
+        B, T, C = x.size() 
+        x = x.reshape(B, T * C)
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        x = self.c_out(x)
+
+        x = x.reshape(B, self.n_head, 1)
+        x = torch.cat([x, - x], dim=-1)
+        x = self.softmax(x, hard=True, dim=-1)
+
+        return x[:, :, 0]
 
 class MLP(nn.Module):
 
@@ -100,10 +140,11 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, head_allocation=None):
+        x = x + self.attn(self.ln_1(x), head_allocation=head_allocation)
         x = x + self.mlp(self.ln_2(x))
         return x
+
 
 @dataclass
 class GPTConfig:
@@ -131,11 +172,14 @@ class GPT(nn.Module):
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
+        # with weight ting when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
         self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+
+        if self.config.dynamic_heads:
+            self.head_controller = HeadController(config)
 
         # init all weights
         self.apply(self._init_weights)
@@ -177,8 +221,14 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+
+        if self.config.dynamic_heads:
+            head_allocation = self.head_controller(x)
+        else:
+            head_allocation = None
+
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, head_allocation=head_allocation)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
